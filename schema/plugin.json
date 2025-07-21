@@ -1,0 +1,8 @@
+{
+  "jupyter.lab.shortcuts": [],
+  "title": "jupyter-engagement-helper",
+  "description": "jupyter-engagement-helper settings.",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}
