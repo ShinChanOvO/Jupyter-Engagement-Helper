@@ -24,19 +24,28 @@ const plugin: JupyterFrontEndPlugin<void> = {
   requires: [INotebookTracker],
 activate: (app, tracker) => {
   console.log('Engagement Helper activated');
+console.log('ENGAGE-BUILD-STAMP', Date.now());
+  /* attach to notebooks already open when JupyterLab starts */
+tracker.forEach((panel: NotebookPanel) => {
+  panel.sessionContext.ready.then(() => attachHandlers(panel));
+});
 
-  // attach to already open notebooks
-  tracker.widgets.forEach(panel => {
-    panel.sessionContext.ready.then(() => attachHandlers(panel));
-  });
-
-  // attach to newly added notebooks
+  /* attach to notebooks opened after activation */
   tracker.widgetAdded.connect((_s, panel) => {
     panel.sessionContext.ready.then(() => attachHandlers(panel));
   });
 
+  /* optional: update currentPanel when user switches tabs */
+  tracker.currentChanged.connect((_s, panel) => {
+    if (panel) {
+      panel.sessionContext.ready.then(() => attachHandlers(panel));
+    }
+  });
+
   window.addEventListener('beforeunload', flush);
 }
+
+
 };
 export default plugin;
 
