@@ -1,4 +1,4 @@
-// @ts-nocheck 
+// @ts-nocheck
 import {
   JupyterFrontEnd,
   JupyterFrontEndPlugin
@@ -14,60 +14,68 @@ interface EngageEvent {
   cell?: number;                    // Execution count
   ename?: string;                   // Error name
 }
-const buffer: EngageEvent[] = [];   // In-memory event buffer
-let lastFlush = 0;                  // Timestamp of last flush
+const buffer: EngageEvent[] = [];
+let lastFlush = 0;
 
 /* ---------- Main plugin ---------- */
 const plugin: JupyterFrontEndPlugin<void> = {
   id: 'jupyter-engagement-helper',
   autoStart: true,
   requires: [INotebookTracker],
-activate: (app, tracker) => {
-  console.log('Engagement Helper activated');
-console.log('ENGAGE-BUILD-STAMP', Date.now());
-  /* attach to notebooks already open when JupyterLab starts */
-tracker.forEach((panel: NotebookPanel) => {
-  panel.sessionContext.ready.then(() => attachHandlers(panel));
-});
+  activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
+    console.log('Engagement Helper activated');
+    console.log('ENGAGE-BUILD-STAMP', Date.now());
 
-  /* attach to notebooks opened after activation */
-  tracker.widgetAdded.connect((_s, panel) => {
-    panel.sessionContext.ready.then(() => attachHandlers(panel));
-  });
+    /* ① notebooks already open when workspace is restored */
+    tracker.restored.then(() => {
+      tracker.forEach((panel: NotebookPanel) => {
+        panel.sessionContext.ready.then(() => attachHandlers(panel));
+      });
+    });
 
-  /* optional: update currentPanel when user switches tabs */
-  tracker.currentChanged.connect((_s, panel) => {
-    if (panel) {
+    /* ② notebooks opened after activation */
+    tracker.widgetAdded.connect((_s, panel) => {
       panel.sessionContext.ready.then(() => attachHandlers(panel));
-    }
-  });
+    });
 
-  window.addEventListener('beforeunload', flush);
-}
+    /* ③ update currentPanel when user switches tabs */
+    tracker.currentChanged.connect((_s, panel) => {
+      if (panel) {
+        panel.sessionContext.ready.then(() => attachHandlers(panel));
+      }
+    });
 
-
+    window.addEventListener('beforeunload', flush);
+  }
 };
 export default plugin;
 
 /* ---------- Attach handlers to a notebook ---------- */
 function attachHandlers(panel: NotebookPanel) {
+  console.log('attachHandlers on', panel.context.path);
   const nbPath = panel.context.path;
   Private.currentPanel = panel;
 
-  log({ ts: Date.now(), evt: 'open', nb: nbPath });
+  // 等 notebook model ready 再记录 open
+  panel.context.ready.then(() => {
+    log({ ts: Date.now(), evt: 'open', nb: nbPath });
+  });
 
-  // Listen for kernel messages to detect runCell / error
-  panel.sessionContext.session?.kernel?.anyMessage?.connect((_s, msg) => {
+  // 监听 kernel 消息：runCell / error
+  panel.sessionContext.session?.kernel?.anyMessage?.connect((_s, args) => {
+    const m = (args as any).msg;
+    if (!m || !m.header) return;
+
     const t = Date.now();
-    if (msg.header.msg_type === 'execute_input') {
-      log({ ts: t, evt: 'runCell', nb: nbPath, cell: msg.content.execution_count });
-    } else if (msg.header.msg_type === 'error') {
+    if (m.header.msg_type === 'execute_input') {
+      log({ ts: t, evt: 'runCell', nb: nbPath, cell: m.content.execution_count });
+    } else if (m.header.msg_type === 'error') {
       log({
         ts: t,
         evt: 'error',
         nb: nbPath,
-        cell: msg.parent_header?.content?.execution_count,
-        ename: msg.content.ename
+        cell: m.parent_header?.content?.execution_count,
+        ename: m.content.ename
       });
     }
   });
@@ -86,8 +94,13 @@ function flush() {
   if (!buffer.length || !Private.currentPanel) return;
 
   const panel = Private.currentPanel;
-  const meta = panel.content.model!.metadata;
-  const prev = (meta.get('engage') as any) ?? {};
+  const model = panel.content?.model;
+  if (!model || !(model as any).metadata || typeof (model as any).metadata.get !== 'function') {
+    return; // model 尚未 ready
+  }
+  const meta = model.metadata as any;
+
+  const prev = meta.get('engage') ?? {};
   const merged = [...(prev.events ?? []), ...buffer].slice(-5000);
   meta.set('engage', { ...prev, events: merged });
 
@@ -133,7 +146,7 @@ function updateSummaryCell(
     const m = nb.model!.contentFactory.createMarkdownCell({});
     m.value.text = md;
     m.metadata.set('tags', [TAG, 'hide_input', 'hide_output']);
-    nb.model!.cells.push(m);
+    nb.model!.cells.insert(0, m); 
   }
 }
 
