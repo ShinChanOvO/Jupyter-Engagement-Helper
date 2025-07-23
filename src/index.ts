@@ -168,7 +168,21 @@ function updateSummaryCell(
   if (cell) {
     cell.model!.value.text = md;            // refresh
   } else {
-    const m = nb.model!.contentFactory.createMarkdownCell({});
+ // ----- create markdown cell (factory may be undefined at first launch) -----
+const model: any = nb.model;
+const factory: any =
+  model?.contentFactory ??   // ≤ 4.1
+  model?.factory ??          // ≥ 4.2
+  null;
+
+if (!factory || !factory.createMarkdownCell) {
+  console.warn('[summary] factory still missing; will try later');
+  return;                    // wait for next flush
+}
+
+const m = factory.createMarkdownCell({});
+
+
     m.value.text = md;
     m.metadata.set('tags', [TAG, 'hide_input', 'hide_output']);
     nb.model!.cells.insert(0, m);           // put at top
