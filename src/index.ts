@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// @ts-nocheck   – quick demo, disable strict TS checks
+// @ts-nocheck  – demo：关闭严格 TS 检查
 // ---------------------------------------------------------------------------
 import {
   JupyterFrontEnd,
@@ -9,201 +9,430 @@ import { NotebookPanel, INotebookTracker } from '@jupyterlab/notebook';
 import { MarkdownCellModel } from '@jupyterlab/cells';
 
 /* ------------------------------------------------------------------ */
-/*  Types & global buffer                                             */
+/* Types & State Management                                           */
 /* ------------------------------------------------------------------ */
-interface EngageEvent {
-  ts: number;
-  evt: 'open' | 'runCell' | 'error';
-  nb: string;
-  cell?: number;
-  ename?: string;
+
+interface Summary {
+  runCnt: number;
+  errCnt: number;
+  activeMs: number;
 }
-const buffer: EngageEvent[] = [];
-let   lastFlush = 0;
+
+// The state for each notebook panel
+interface PanelState {
+  summary: Summary;      // In-memory cache of the summary
+  saveTimeout: number;   // ID for the debounced save timer
+  activityInterval: number;
+}
+
+const panelState = new WeakMap<NotebookPanel, PanelState>();
+const SAVE_DEBOUNCE_MS = 750; // Wait 750ms after the last change before saving to file
+const ACTIVITY_INTERVAL_MS = 5000;
 
 /* ------------------------------------------------------------------ */
-/*  Plugin definition                                                 */
+/* JupyterLab Extension                                               */
 /* ------------------------------------------------------------------ */
 const plugin: JupyterFrontEndPlugin<void> = {
-  id       : 'jupyter-engagement-helper',
+  id: 'jupyter-engagement-helper-final-v2',
   autoStart: true,
-  requires : [INotebookTracker],
-  activate : (_app: JupyterFrontEnd, tracker: INotebookTracker) => {
-    console.log('[plugin] activated', Date.now());
+  requires: [INotebookTracker],
+  activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
+    console.log('[engagement] Activated with debounced-save logic.');
 
-    tracker.restored.then(() => {
-      tracker.forEach(p => p.sessionContext.ready.then(() => attach(p)));
+    tracker.widgetAdded.connect((_, panel) => attach(panel));
+    app.restored.then(() => {
+      tracker.forEach(panel => attach(panel));
     });
-
-    tracker.widgetAdded.connect((_s, p) =>
-      p.sessionContext.ready.then(() => attach(p)));
-
-    tracker.currentChanged.connect((_s, p) => {
-      if (p) p.sessionContext.ready.then(() => attach(p));
-    });
-
-    window.addEventListener('beforeunload', flush);
   }
 };
 export default plugin;
 
 /* ------------------------------------------------------------------ */
-/*  Attach listeners to one notebook                                  */
+/* Attach Listeners to a Single NotebookPanel                         */
 /* ------------------------------------------------------------------ */
 function attach(panel: NotebookPanel) {
-  const nbPath = panel.context.path;
-  console.log('[attach] on', nbPath);
-  Private.current = panel;
-
-  /* record one “open” */
-  panel.context.ready.then(() => {
-    log({ ts: Date.now(), evt: 'open', nb: nbPath });
-    flush();
-  });
-
-  /* kernel traffic */
-  panel.sessionContext.session?.kernel?.anyMessage?.connect((_s, a) => {
-    const m = (a as any).msg;
-    if (!m?.header) return;
-
-    const t = Date.now();
-    if (m.header.msg_type === 'execute_input') {
-      log({ ts: t, evt: 'runCell', nb: nbPath,
-            cell: m.content.execution_count });
-    } else if (m.header.msg_type === 'error') {
-      log({ ts: t, evt: 'error', nb: nbPath,
-            cell : m.parent_header?.content?.execution_count,
-            ename: m.content.ename });
+  if (panelState.has(panel)) {
+    return;
+  }
+  
+  panel.sessionContext.ready.then(() => {
+    if (panelState.has(panel) || panel.isDisposed) {
+      return;
     }
+    
+    console.log(`[attach] Notebook ready, attaching to ${panel.context.path}`);
+
+    // --- FIX: LOAD ONCE ---
+    // Load the summary from metadata and create our in-memory state object
+    const nbMd = panel.content.model.metadata;
+    const store = nbMd.get ? (nbMd.get('engage') ?? {}) : (nbMd.engage ?? {});
+    const summary: Summary = store.summary ?? { runCnt: 0, errCnt: 0, activeMs: 0 };
+    
+    panelState.set(panel, {
+        summary: summary,
+        saveTimeout: 0,
+        activityInterval: 0
+    });
+
+    // Display what we loaded
+    showStoredSummary(panel);
+
+    // Attach event listeners
+    panel.sessionContext.session?.kernel?.anyMessage.connect((_, args) => {
+      const msg = args.msg;
+      if (msg.header.msg_type === 'execute_input') {
+        updateInMemorySummary(panel, { addRun: 1 });
+        trackActiveTime(panel);
+      } else if (msg.header.msg_type === 'error') {
+        updateInMemorySummary(panel, { addErr: 1 });
+        trackActiveTime(panel);
+      }
+    });
+
+    // Cleanup on close
+    panel.disposed.connect(() => {
+      const state = panelState.get(panel);
+      if (state) {
+        clearTimeout(state.saveTimeout);
+        clearInterval(state.activityInterval);
+      }
+      panelState.delete(panel);
+      console.log(`[attach] Cleaned up ${panel.context.path}`);
+    });
+
+  }).catch(error => {
+    console.error(`Failed to attach to notebook ${panel.context.path}:`, error);
   });
+}
 
-  panel.revealed.then(() => requestAnimationFrame(flush));
+function trackActiveTime(panel: NotebookPanel) {
+  const state = panelState.get(panel);
+  if (!state || state.activityInterval) return;
+
+  updateInMemorySummary(panel, { addMs: ACTIVITY_INTERVAL_MS });
+  
+  state.activityInterval = window.setInterval(() => {
+    updateInMemorySummary(panel, { addMs: ACTIVITY_INTERVAL_MS });
+  }, ACTIVITY_INTERVAL_MS);
 }
 
 /* ------------------------------------------------------------------ */
-/*  Buffer util                                                       */
+/* Core Logic: In-Memory Update & Debounced Save                      */
 /* ------------------------------------------------------------------ */
-function log(e: EngageEvent) {
-  buffer.push(e);
-  if (buffer.length >= 200 || Date.now() - lastFlush > 5_000) flush();
-}
 
-/* ------------------------------------------------------------------ */
-/*  Persist + cumulative summary                                      */
-/* ------------------------------------------------------------------ */
-function flush() {
-  if (!buffer.length || !Private.current) return;
-
-  const panel = Private.current;
-  const nbMd  = panel.content?.model?.metadata as any;
-  if (!nbMd) return;                                // still not ready
-
-  /* read existing storage */
-  const oldStore = nbMd.get ? nbMd.get('engage') ?? {} : nbMd.engage ?? {};
-  const oldSum   = oldStore.summary ?? { runCnt:0, errCnt:0, startTs:null };
-
-  /* delta inside this flush */
-  let deltaRun = 0, deltaErr = 0;
-  buffer.forEach(e => {
-    if (e.evt === 'runCell') deltaRun++;
-    else if (e.evt === 'error') deltaErr++;
-  });
-
-  /* accumulate */
-  const startTs  = oldSum.startTs ?? buffer[0].ts;
-  const lastTs   = buffer[buffer.length - 1].ts;
-  const summary  = {
-    runCnt : oldSum.runCnt + deltaRun,
-    errCnt : oldSum.errCnt + deltaErr,
-    startTs,
-    activeMs: lastTs - startTs
-  };
-
-  /* keep events ≤ 5 000 */
-  const events = [...(oldStore.events ?? []), ...buffer].slice(-5000);
-
-  /* write back */
-  const nextStore = { events, summary };
-  nbMd.set ? nbMd.set('engage', nextStore) : nbMd.engage = nextStore;
-
-  updateSummary(panel, summary);     // refresh / insert markdown
-
-  buffer.length = 0;
-  lastFlush     = Date.now();
-}
-
-/* ------------------------------------------------------------------ */
-/*  Refresh or insert summary markdown                                */
-/* ------------------------------------------------------------------ */
-function updateSummary(
-  panel  : NotebookPanel,
-  s      : { runCnt:number; errCnt:number; activeMs:number }
+function updateInMemorySummary(
+  panel: NotebookPanel,
+  updates: { addRun?: number; addErr?: number; addMs?: number }
 ) {
-  const nb  = panel.content;
+  const state = panelState.get(panel);
+  if (!state) return;
+
+  // --- FIX: Update the in-memory summary object directly ---
+  const { summary } = state;
+  summary.runCnt += updates.addRun ?? 0;
+  summary.errCnt += updates.addErr ?? 0;
+  summary.activeMs += updates.addMs ?? 0;
+  
+  console.log('[update] In-memory summary is now:', summary);
+
+  // Update the UI immediately
+  updateSummaryUI(panel, summary);
+  
+  // --- FIX: Debounce the save-to-file operation ---
+  clearTimeout(state.saveTimeout); // Clear any previous pending save
+  state.saveTimeout = window.setTimeout(() => {
+    persistSummaryToFile(panel);
+  }, SAVE_DEBOUNCE_MS);
+}
+
+function persistSummaryToFile(panel: NotebookPanel) {
+    const state = panelState.get(panel);
+    const nbModel = panel.content?.model;
+    if (!state || !nbModel) return;
+
+    console.log(`%c[save] Persisting to file:`, 'color: green; font-weight: bold;', state.summary);
+
+    const nbMd = nbModel.metadata;
+    const store = nbMd.get ? (nbMd.get('engage') ?? {}) : (nbMd.engage ?? {});
+    const newData = { ...store, summary: state.summary };
+    nbMd.set ? nbMd.set('engage', newData) : (nbMd.engage = newData);
+}
+
+/* ------------------------------------------------------------------ */
+/* UI Update Functions                                                */
+/* ------------------------------------------------------------------ */
+
+function showStoredSummary(panel: NotebookPanel) {
+  const state = panelState.get(panel);
+  if (state) {
+    console.log('[show] Displaying loaded summary:', state.summary);
+    updateSummaryUI(panel, state.summary);
+  }
+}
+
+function updateSummaryUI(panel: NotebookPanel, s: Summary) {
+  const nb = panel.content;
   const TAG = 'engage-summary';
 
-  /* locate existing */
-  const cellWidget: any = nb.widgets.find(w => {
-    if (w.model?.type !== 'markdown') return false;
-    const meta: any = w.model.metadata;
-    const tags = meta.get ? meta.get('tags') : meta.tags;
+  const md = `**Engagement Summary (auto-generated)**
+
+| Metric | Value |
+|:---|---:|
+| Run count | ${s.runCnt} |
+| Error count | ${s.errCnt} |
+| Active time (min) | ${Math.round(s.activeMs / 60000)} |`.trim();
+
+  const w: any = nb.widgets.find(c => {
+    if (c.model?.type !== 'markdown') return false;
+    const tags = c.model.metadata.get ? c.model.metadata.get('tags') : c.model.metadata.tags;
     return Array.isArray(tags) && tags.includes(TAG);
   });
 
-  const md = `
-<!-- auto -->
-**Engagement Summary (auto-generated)**
-
-| Metric | Value |
-|--------|-------|
-| Run count | ${s.runCnt} |
-| Error count | ${s.errCnt} |
-| Active time (min) | ${Math.round(s.activeMs / 60000)} |
-  `.trim();
-
-  /* ---------------- update existing ---------------- */
-  if (cellWidget) {
-    const model: any = cellWidget.model;
-    if (model.sharedModel?.setSource) model.sharedModel.setSource(md);
-    else                              model.value.text = md;
+  if (w) {
+    const model = w.model;
+    if (model && model.sharedModel) {
+      if (model.sharedModel.getSource() !== md) {
+        model.sharedModel.setSource(md);
+      }
+    }
     return;
   }
 
-  /* ---------------- need a new cell ---------------- */
-  const nbModel: any = nb.model;
-  let newModel: any;
-
-  // try JLab ≥4.1 factory
-  if (nbModel?.contentFactory?.createMarkdownCell) {
-    newModel = nbModel.contentFactory.createMarkdownCell({});
-  } else if (nbModel?.factory?.createMarkdownCell) {   // 4.2+
-    newModel = nbModel.factory.createMarkdownCell({});
-  } else {
-    newModel = new MarkdownCellModel({});
-  }
-
-  /* set source + tags */
-  if (newModel.sharedModel?.setSource) newModel.sharedModel.setSource(md);
-  else                                 newModel.value.text = md;
-
-  const mMeta: any = newModel.metadata;
-  if (mMeta?.set) mMeta.set('tags', [TAG, 'hide_input', 'hide_output']);
-
-  /* insert safely (only if API 可用) */
-  if (nbModel?.cells?.insert) {
-    nbModel.cells.insert(0, newModel);
-  } else if (nbModel?.sharedModel?.insertCell) {
-    nbModel.sharedModel.insertCell(0, {
-      cell_type : 'markdown',
-      source    : md,
-      metadata  : { tags:[TAG,'hide_input','hide_output'] }
+  // If no cell is found, create one
+  if (nb.model && nb.model.contentFactory) {
+    const factory = nb.model.contentFactory;
+    const newCell = factory.createMarkdownCell({
+      cell: {
+        cell_type: 'markdown',
+        source: md,
+        metadata: { tags: [TAG] }
+      }
     });
-  } else {
-    console.warn('[summary] no cell-insert API, skip creating cell');
+    nb.model.cells.insert(0, newCell);
   }
+}// ---------------------------------------------------------------------------
+// @ts-nocheck  – demo：关闭严格 TS 检查
+// ---------------------------------------------------------------------------
+import {
+  JupyterFrontEnd,
+  JupyterFrontEndPlugin
+} from '@jupyterlab/application';
+import { NotebookPanel, INotebookTracker } from '@jupyterlab/notebook';
+import { MarkdownCellModel } from '@jupyterlab/cells';
+
+/* ------------------------------------------------------------------ */
+/* Types & State Management                                           */
+/* ------------------------------------------------------------------ */
+
+interface Summary {
+  runCnt: number;
+  errCnt: number;
+  activeMs: number;
+}
+
+// The state for each notebook panel
+interface PanelState {
+  summary: Summary;      // In-memory cache of the summary
+  saveTimeout: number;   // ID for the debounced save timer
+  activityInterval: number;
+}
+
+const panelState = new WeakMap<NotebookPanel, PanelState>();
+const SAVE_DEBOUNCE_MS = 750; // Wait 750ms after the last change before saving to file
+const ACTIVITY_INTERVAL_MS = 5000;
+
+/* ------------------------------------------------------------------ */
+/* JupyterLab Extension                                               */
+/* ------------------------------------------------------------------ */
+const plugin: JupyterFrontEndPlugin<void> = {
+  id: 'jupyter-engagement-helper-persistent', // Final version ID
+  autoStart: true,
+  requires: [INotebookTracker],
+  activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
+    console.log('[engagement] Activated with persistent save-on-exit logic.');
+
+    tracker.widgetAdded.connect((_, panel) => attach(panel));
+    app.restored.then(() => {
+      tracker.forEach(panel => attach(panel));
+    });
+
+    // --- FINAL FIX: SAVE ON EXIT ---
+    // This listener triggers when you try to refresh or close the tab.
+    window.addEventListener('beforeunload', () => {
+      console.log('[engagement] Unload event detected, forcing a save for all notebooks...');
+      // Iterate over every open notebook tracked by JupyterLab
+      tracker.forEach(panel => {
+        if (panel && !panel.isDisposed) {
+            // Immediately save any pending changes for this notebook
+            persistSummaryToFile(panel);
+        }
+      });
+    });
+  }
+};
+export default plugin;
+
+/* ------------------------------------------------------------------ */
+/* Attach Listeners to a Single NotebookPanel                         */
+/* ------------------------------------------------------------------ */
+function attach(panel: NotebookPanel) {
+  if (panelState.has(panel)) {
+    return;
+  }
+  
+  panel.sessionContext.ready.then(() => {
+    if (panelState.has(panel) || panel.isDisposed) {
+      return;
+    }
+    
+    console.log(`[attach] Notebook ready, attaching to ${panel.context.path}`);
+
+    // Load the summary from metadata and create our in-memory state object
+    const nbMd = panel.content.model.metadata;
+    const store = nbMd.get ? (nbMd.get('engage') ?? {}) : (nbMd.engage ?? {});
+    const summary: Summary = store.summary ?? { runCnt: 0, errCnt: 0, activeMs: 0 };
+    
+    panelState.set(panel, {
+        summary: summary,
+        saveTimeout: 0,
+        activityInterval: 0
+    });
+
+    // Display what we loaded
+    showStoredSummary(panel);
+
+    // Attach event listeners
+    panel.sessionContext.session?.kernel?.anyMessage.connect((_, args) => {
+      const msg = args.msg;
+      if (msg.header.msg_type === 'execute_input') {
+        updateInMemorySummary(panel, { addRun: 1 });
+        trackActiveTime(panel);
+      } else if (msg.header.msg_type === 'error') {
+        updateInMemorySummary(panel, { addErr: 1 });
+        trackActiveTime(panel);
+      }
+    });
+
+    // Cleanup on close
+    panel.disposed.connect(() => {
+      const state = panelState.get(panel);
+      if (state) {
+        clearTimeout(state.saveTimeout);
+        clearInterval(state.activityInterval);
+      }
+      panelState.delete(panel);
+      console.log(`[attach] Cleaned up ${panel.context.path}`);
+    });
+
+  }).catch(error => {
+    console.error(`Failed to attach to notebook ${panel.context.path}:`, error);
+  });
+}
+
+function trackActiveTime(panel: NotebookPanel) {
+  const state = panelState.get(panel);
+  if (!state || state.activityInterval) return;
+
+  updateInMemorySummary(panel, { addMs: ACTIVITY_INTERVAL_MS });
+  
+  state.activityInterval = window.setInterval(() => {
+    updateInMemorySummary(panel, { addMs: ACTIVITY_INTERVAL_MS });
+  }, ACTIVITY_INTERVAL_MS);
 }
 
 /* ------------------------------------------------------------------ */
-namespace Private {
-  export let current: NotebookPanel | null = null;
+/* Core Logic: In-Memory Update & Debounced Save                      */
+/* ------------------------------------------------------------------ */
+
+function updateInMemorySummary(
+  panel: NotebookPanel,
+  updates: { addRun?: number; addErr?: number; addMs?: number }
+) {
+  const state = panelState.get(panel);
+  if (!state) return;
+
+  // Update the in-memory summary object directly
+  const { summary } = state;
+  summary.runCnt += updates.addRun ?? 0;
+  summary.errCnt += updates.addErr ?? 0;
+  summary.activeMs += updates.addMs ?? 0;
+
+  // Update the UI immediately
+  updateSummaryUI(panel, summary);
+  
+  // Debounce the save-to-file operation
+  clearTimeout(state.saveTimeout); // Clear any previous pending save
+  state.saveTimeout = window.setTimeout(() => {
+    persistSummaryToFile(panel);
+  }, SAVE_DEBOUNCE_MS);
+}
+
+function persistSummaryToFile(panel: NotebookPanel) {
+    const state = panelState.get(panel);
+    const nbModel = panel.content?.model;
+    if (!state || !nbModel) return;
+
+    // Before saving, cancel any pending debounced save to avoid redundancy
+    clearTimeout(state.saveTimeout);
+
+    console.log(`%c[save] Persisting summary to file:`, 'color: green; font-weight: bold;', state.summary);
+
+    const nbMd = nbModel.metadata;
+    const store = nbMd.get ? (nbMd.get('engage') ?? {}) : (nbMd.engage ?? {});
+    const newData = { ...store, summary: state.summary };
+    nbMd.set ? nbMd.set('engage', newData) : (nbMd.engage = newData);
+}
+
+/* ------------------------------------------------------------------ */
+/* UI Update Functions                                                */
+/* ------------------------------------------------------------------ */
+
+function showStoredSummary(panel: NotebookPanel) {
+  const state = panelState.get(panel);
+  if (state) {
+    console.log('[show] Displaying loaded summary:', state.summary);
+    updateSummaryUI(panel, state.summary);
+  }
+}
+
+function updateSummaryUI(panel: NotebookPanel, s: Summary) {
+  const nb = panel.content;
+  const TAG = 'engage-summary';
+
+  const md = `**Engagement Summary (auto-generated)**
+
+| Metric | Value |
+|:---|---:|
+| Run count | ${s.runCnt} |
+| Error count | ${s.errCnt} |
+| Active time (min) | ${Math.round(s.activeMs / 60000)} |`.trim();
+
+  const w: any = nb.widgets.find(c => {
+    if (c.model?.type !== 'markdown') return false;
+    const tags = c.model.metadata.get ? c.model.metadata.get('tags') : c.model.metadata.tags;
+    return Array.isArray(tags) && tags.includes(TAG);
+  });
+
+  if (w) {
+    const model = w.model;
+    if (model && model.sharedModel) {
+      if (model.sharedModel.getSource() !== md) {
+        model.sharedModel.setSource(md);
+      }
+    }
+    return;
+  }
+
+  // If no cell is found, create one
+  if (nb.model && nb.model.contentFactory) {
+    const factory = nb.model.contentFactory;
+    const newCell = factory.createMarkdownCell({
+      cell: {
+        cell_type: 'markdown',
+        source: md,
+        metadata: { tags: [TAG] }
+      }
+    });
+    nb.model.cells.insert(0, newCell);
+  }
 }
