@@ -6,41 +6,48 @@ import {
 import { NotebookPanel, INotebookTracker } from '@jupyterlab/notebook';
 import { MarkdownCell } from '@jupyterlab/cells';
 
-/* ---------- Types & buffer ---------- */
+/* ------------------------------------------------------------------ */
+/*  Types & global buffer                                              */
+/* ------------------------------------------------------------------ */
 interface EngageEvent {
-  ts: number;                       // Unix epoch (ms)
-  evt: 'open' | 'runCell' | 'error';
-  nb: string;                       // Notebook path
-  cell?: number;                    // Execution count
-  ename?: string;                   // Error name
+  ts: number;                         // Unix epoch (ms)
+  evt: 'open' | 'runCell' | 'error';  // event kind
+  nb: string;                         // notebook path
+  cell?: number;                      // exec counter
+  ename?: string;                     // error name
 }
 const buffer: EngageEvent[] = [];
 let lastFlush = 0;
 
-/* ---------- Main plugin ---------- */
+/* ------------------------------------------------------------------ */
+/*  JupyterLab plugin                                                  */
+/* ------------------------------------------------------------------ */
 const plugin: JupyterFrontEndPlugin<void> = {
   id: 'jupyter-engagement-helper',
   autoStart: true,
   requires: [INotebookTracker],
   activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
-    console.log('Engagement Helper activated');
-    console.log('ENGAGE-BUILD-STAMP', Date.now());
+    console.log('[plugin] activated');
+    console.log('[plugin] build-stamp', Date.now());
 
-    /* ① notebooks already open when workspace is restored */
+    /* A) notebooks already open when workspace is restored */
     tracker.restored.then(() => {
+      console.log('[plugin] tracker.restored');
       tracker.forEach((panel: NotebookPanel) => {
         panel.sessionContext.ready.then(() => attachHandlers(panel));
       });
     });
 
-    /* ② notebooks opened after activation */
+    /* B) notebooks opened after activation */
     tracker.widgetAdded.connect((_s, panel) => {
+      console.log('[plugin] widgetAdded', panel.context.path);
       panel.sessionContext.ready.then(() => attachHandlers(panel));
     });
 
-    /* ③ update currentPanel when user switches tabs */
+    /* C) update currentPanel when user switches tabs */
     tracker.currentChanged.connect((_s, panel) => {
       if (panel) {
+        console.log('[plugin] currentChanged', panel.context.path);
         panel.sessionContext.ready.then(() => attachHandlers(panel));
       }
     });
@@ -50,20 +57,23 @@ const plugin: JupyterFrontEndPlugin<void> = {
 };
 export default plugin;
 
-/* ---------- Attach handlers to a notebook ---------- */
+/* ------------------------------------------------------------------ */
+/*  Attach listeners to one notebook panel                             */
+/* ------------------------------------------------------------------ */
 function attachHandlers(panel: NotebookPanel) {
-  console.log('attachHandlers on', panel.context.path);
   const nbPath = panel.context.path;
+  console.log('[attach] on', nbPath);
   Private.currentPanel = panel;
 
-  // 等 notebook model ready 再记录 open
+  /* record “open” once the model is ready */
   panel.context.ready.then(() => {
     log({ ts: Date.now(), evt: 'open', nb: nbPath });
+    flush();                                 // force first write
   });
 
-  // 监听 kernel 消息：runCell / error
+  /* listen for kernel messages */
   panel.sessionContext.session?.kernel?.anyMessage?.connect((_s, args) => {
-    const m = (args as any).msg;
+    const m = (args as any).msg;             // actual kernel message
     if (!m || !m.header) return;
 
     const t = Date.now();
@@ -81,30 +91,39 @@ function attachHandlers(panel: NotebookPanel) {
   });
 }
 
-/* ---------- Buffer logic ---------- */
+/* ------------------------------------------------------------------ */
+/*  Buffer helper                                                      */
+/* ------------------------------------------------------------------ */
 function log(e: EngageEvent) {
   buffer.push(e);
-  if (buffer.length >= 200 || Date.now() - lastFlush > 5000) {
+  console.log('[log] push', e);
+  if (buffer.length >= 200 || Date.now() - lastFlush > 5_000) {
     flush();
   }
 }
 
-/* ---------- Flush to notebook metadata ---------- */
+/* ------------------------------------------------------------------ */
+/*  Persist events into notebook metadata                              */
+/* ------------------------------------------------------------------ */
 function flush() {
   if (!buffer.length || !Private.currentPanel) return;
 
   const panel = Private.currentPanel;
   const model = panel.content?.model;
-  if (!model || !(model as any).metadata || typeof (model as any).metadata.get !== 'function') {
-    return; // model 尚未 ready
-  }
-  const meta = model.metadata as any;
+  if (!model || !model.metadata) return;     // model not ready
 
-  const prev = meta.get('engage') ?? {};
+  const meta: any = model.metadata;
+  const useGet = typeof meta.get === 'function';
+  const prev   = useGet ? meta.get('engage') ?? {} : meta.engage ?? {};
+
   const merged = [...(prev.events ?? []), ...buffer].slice(-5000);
-  meta.set('engage', { ...prev, events: merged });
 
-  // Build summary numbers
+  if (useGet) meta.set('engage', { ...prev, events: merged });
+  else        meta.engage = { ...prev, events: merged };
+
+  console.log('[flush] wrote', merged.length, 'events');
+
+  /* summary numbers */
   const summary = {
     runCnt: merged.filter(e => e.evt === 'runCell').length,
     errCnt: merged.filter(e => e.evt === 'error').length,
@@ -116,18 +135,24 @@ function flush() {
   lastFlush = Date.now();
 }
 
-/* ---------- Auto-generated summary markdown ---------- */
+/* ------------------------------------------------------------------ */
+/*  Insert / refresh summary markdown                                 */
+/* ------------------------------------------------------------------ */
 function updateSummaryCell(
   panel: NotebookPanel,
   s: { runCnt: number; errCnt: number; activeMs: number }
 ) {
-  const nb = panel.content;
-  const TAG = 'engage-summary';
-  let cell = nb.widgets.find(
-    w =>
-      w.model?.type === 'markdown' &&
-      (w.model?.metadata.get('tags') as string[] | undefined)?.includes(TAG)
-  ) as MarkdownCell | undefined;
+  const nb   = panel.content;
+  const TAG  = 'engage-summary';
+
+  /* locate existing summary cell (metadata may be plain object) */
+  let cell = nb.widgets.find(w => {
+    if (w.model?.type !== 'markdown') return false;
+    const meta: any     = w.model.metadata;
+    const tags: string[] =
+      typeof meta.get === 'function' ? meta.get('tags') : meta.tags;
+    return Array.isArray(tags) && tags.includes(TAG);
+  }) as MarkdownCell | undefined;
 
   const md = `
 <!-- auto -->
@@ -141,16 +166,18 @@ function updateSummaryCell(
 `.trim();
 
   if (cell) {
-    cell.model!.value.text = md;
+    cell.model!.value.text = md;            // refresh
   } else {
     const m = nb.model!.contentFactory.createMarkdownCell({});
     m.value.text = md;
     m.metadata.set('tags', [TAG, 'hide_input', 'hide_output']);
-    nb.model!.cells.insert(0, m); 
+    nb.model!.cells.insert(0, m);           // put at top
   }
 }
 
-/* ---------- Private helper namespace ---------- */
+/* ------------------------------------------------------------------ */
+/*  Private namespace                                                  */
+/* ------------------------------------------------------------------ */
 namespace Private {
   export let currentPanel: NotebookPanel | null = null;
 }
