@@ -33,7 +33,7 @@ const ENGAGEMENT_CREDIT_MS = 5000;
 /* JupyterLab Extension                                               */
 /* ------------------------------------------------------------------ */
 const plugin: JupyterFrontEndPlugin<void> = {
-  id: 'jupyter-engagement-full-persistence-final',
+  id: 'jupyter-engagement-full-persistence-final-v2',
   autoStart: true,
   requires: [INotebookTracker],
   activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
@@ -87,14 +87,8 @@ export default plugin;
 /* State and UI Management (Helper functions defined first)           */
 /* ------------------------------------------------------------------ */
 
-// In-memory state for each notebook.
 const panelState = new Map<NotebookPanel, PanelState>();
 
-/**
- * Finds the summary cell. If it doesn't exist, creates it and inserts it
- * at the top of the notebook.
- * @returns The MarkdownCell widget for the summary.
- */
 function findOrCreateSummaryCell(notebook: Notebook): MarkdownCell | null {
   for (const widget of notebook.widgets) {
     if (widget.model.type === 'markdown') {
@@ -105,22 +99,9 @@ function findOrCreateSummaryCell(notebook: Notebook): MarkdownCell | null {
         }
     }
   }
-  console.log('[UI] Summary cell not found, creating one.');
-  if (notebook.model && notebook.model.contentFactory) {
-      const factory = notebook.model.contentFactory;
-      const newCell = factory.createMarkdownCell({});
-      const metadata = newCell.model.metadata;
-      if (metadata.set) metadata.set('tags', [SUMMARY_CELL_TAG]);
-      else metadata['tags'] = [SUMMARY_CELL_TAG];
-      notebook.model.cells.insert(0, newCell.model);
-      return newCell;
-  }
-  return null;
+  return null; // Only find, do not create here. Creation is handled in updateSummaryUI.
 }
 
-/**
- * Renders the data from memory into the summary cell's markdown table.
- */
 function updateSummaryUI(panel: NotebookPanel) {
     const state = panelState.get(panel);
     const nb: Notebook = panel.content;
@@ -148,9 +129,33 @@ function updateSummaryUI(panel: NotebookPanel) {
 | Unique Cells Run | ${summary.uniqueCellsExecuted} |
 | Progress Completion | ${progress}% |`.trim();
   
-    const summaryCell = findOrCreateSummaryCell(nb);
-    if (summaryCell) {
-        const model = summaryCell.model as MarkdownCellModel;
+    let summaryCellWidget = findOrCreateSummaryCell(nb);
+    
+    // If cell doesn't exist, create it using the robust method
+    if (!summaryCellWidget) {
+        console.log('[UI] Summary cell not found, creating one.');
+        const newCellModel = new MarkdownCellModel({ metadata: { tags: [SUMMARY_CELL_TAG] } });
+        newCellModel.sharedModel.setSource(md);
+
+        if (nb.model.cells && nb.model.cells.insert) {
+            nb.model.cells.insert(0, newCellModel);
+        } else if (nb.model.sharedModel && (nb.model.sharedModel as any).insertCell) {
+            (nb.model.sharedModel as any).insertCell(0, {
+              cell_type: 'markdown',
+              source: md,
+              metadata: { tags: [SUMMARY_CELL_TAG] }
+            });
+        } else {
+            console.warn('[UI] Could not find a method to insert the new cell.');
+            return; // Exit if we can't create the cell
+        }
+        // After creation, find it again to ensure we have the widget handle
+        summaryCellWidget = findOrCreateSummaryCell(nb);
+    }
+    
+    // Update the content of the (now existing) cell
+    if (summaryCellWidget) {
+        const model = summaryCellWidget.model as MarkdownCellModel;
         if (model.sharedModel.getSource() !== md) {
             model.sharedModel.setSource(md);
         }
@@ -159,12 +164,9 @@ function updateSummaryUI(panel: NotebookPanel) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Core Logic & Event Handlers (Main logic that uses helpers)         */
+/* Core Logic & Event Handlers                                        */
 /* ------------------------------------------------------------------ */
 
-/**
- * On startup, this reads the data from the UI to populate the initial state.
- */
 function loadSummaryFromUI(panel: NotebookPanel) {
     let summary: Summary = { runCnt: 0, errCnt: 0, activeMs: 0, markdownActiveMs: 0, uniqueCellsExecuted: 0 };
     let cellExists = false;
@@ -172,7 +174,6 @@ function loadSummaryFromUI(panel: NotebookPanel) {
     const summaryCell = findOrCreateSummaryCell(panel.content);
     if (summaryCell) {
         const source = summaryCell.model.sharedModel.getSource();
-        
         const runMatch = source.match(/\| Run count\s*\|\s*(\d+)\s*\|/);
         const errMatch = source.match(/\| Error count\s*\|\s*(\d+)\s*\|/);
         const activeTimeMatch = source.match(/\| Active time \(min\)\s*\|\s*(\d+)\s*\|/);
@@ -185,8 +186,7 @@ function loadSummaryFromUI(panel: NotebookPanel) {
         if (markdownTimeMatch) summary.markdownActiveMs = parseInt(markdownTimeMatch[1], 10) * 60000;
         if (uniqueCellsMatch) summary.uniqueCellsExecuted = parseInt(uniqueCellsMatch[1], 10);
         
-        // Check if the cell we found actually contained data.
-        if (runMatch && errMatch && activeTimeMatch) {
+        if (runMatch) {
             cellExists = true;
             console.log(`%c[load] Successfully parsed summary from UI:`, 'color: green; font-weight: bold;', summary);
         }
@@ -199,15 +199,11 @@ function loadSummaryFromUI(panel: NotebookPanel) {
         executedCells: new Set() 
     });
 
-    if (!cellExists) {
-        console.log('[load] Summary cell not found or was empty. Creating/updating.');
-        updateSummaryUI(panel);
-    }
+    // Create/update the UI cell. If it doesn't exist, this will create it.
+    // If it exists, this will refresh it (in case the progress % needs updating).
+    updateSummaryUI(panel);
 }
 
-/**
- * Handles changes in the active cell to track time spent on markdown.
- */
 function handleActiveCellChange(panel: NotebookPanel, newActiveCell: Cell) {
     const state = panelState.get(panel);
     if (!state) return;
@@ -215,7 +211,6 @@ function handleActiveCellChange(panel: NotebookPanel, newActiveCell: Cell) {
     if (state.markdownFocusStartTs) {
         const duration = Date.now() - state.markdownFocusStartTs;
         state.summary.markdownActiveMs += duration;
-        console.log(`[metrics] Added ${Math.round(duration/1000)}s to Markdown time.`);
     }
 
     if (newActiveCell && newActiveCell.model.type === 'markdown') {
@@ -227,9 +222,6 @@ function handleActiveCellChange(panel: NotebookPanel, newActiveCell: Cell) {
     updateSummaryUI(panel);
 }
 
-/**
- * Handles a successful cell execution.
- */
 function handleCellRun(panel: NotebookPanel, cell: Cell) {
     const state = panelState.get(panel);
     if (!state) return;
@@ -248,9 +240,6 @@ function handleCellRun(panel: NotebookPanel, cell: Cell) {
     updateSummaryUI(panel);
 }
 
-/**
- * Handles an error during cell execution.
- */
 function handleCellError(panel: NotebookPanel, cell: Cell) {
     const state = panelState.get(panel);
     if (!state) return;
