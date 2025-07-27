@@ -1,6 +1,4 @@
-// ---------------------------------------------------------------------------
 // @ts-nocheck  – demo：关闭严格 TS 检查
-// ---------------------------------------------------------------------------
 import {
   JupyterFrontEnd,
   JupyterFrontEndPlugin
@@ -33,22 +31,28 @@ const ENGAGEMENT_CREDIT_MS = 5000;
 /* JupyterLab Extension                                               */
 /* ------------------------------------------------------------------ */
 const plugin: JupyterFrontEndPlugin<void> = {
-  id: 'jupyter-engagement-full-persistence-final-v2',
+  id: 'jupyter-engagement-final-corrected',
   autoStart: true,
   requires: [INotebookTracker],
   activate: (app: JupyterFrontEnd, tracker: INotebookTracker) => {
-    console.log('[engagement] Activated with full persistence logic.');
+    console.log('[engagement] Activated with final corrected logic.');
 
+    // This WeakSet keeps track of notebooks we've already attached to.
     const attachedPanels = new WeakSet<NotebookPanel>();
 
     const attach = (panel: NotebookPanel) => {
-      if (attachedPanels.has(panel) || panel.isDisposed) return;
-      
+      // --- FIX for Double-Counting ---
+      // If we have already attached to this panel, do nothing.
+      if (attachedPanels.has(panel) || panel.isDisposed) {
+        return;
+      }
+      // "Claim" this panel immediately to prevent other events from re-attaching.
+      attachedPanels.add(panel);
+
       Promise.all([panel.context.ready, panel.sessionContext.ready]).then(() => {
         if (panel.isDisposed) return;
         
-        console.log(`[attach] Attaching to ${panel.context.path}`);
-        attachedPanels.add(panel);
+        console.log(`[attach] Attaching listeners to ${panel.context.path}`);
         
         loadSummaryFromUI(panel); 
 
@@ -68,13 +72,18 @@ const plugin: JupyterFrontEndPlugin<void> = {
           }
         });
 
-        panel.disposed.connect(() => attachedPanels.delete(panel) );
+        panel.disposed.connect(() => {
+          // No need to remove from WeakSet, it's handled automatically
+          console.log(`[attach] Cleaned up ${panel.context.path}`);
+        });
 
       }).catch(error => {
         console.error(`[attach] Failed to attach:`, error);
+        attachedPanels.delete(panel); // If setup fails, allow a retry
       });
     };
 
+    // Call attach for newly opened and restored notebooks.
     tracker.widgetAdded.connect((_, panel) => attach(panel));
     app.restored.then(() => {
       tracker.forEach(panel => attach(panel));
@@ -84,7 +93,7 @@ const plugin: JupyterFrontEndPlugin<void> = {
 export default plugin;
 
 /* ------------------------------------------------------------------ */
-/* State and UI Management (Helper functions defined first)           */
+/* Core Logic: Find, Parse, and Update Summary Cell                   */
 /* ------------------------------------------------------------------ */
 
 const panelState = new Map<NotebookPanel, PanelState>();
@@ -99,7 +108,7 @@ function findOrCreateSummaryCell(notebook: Notebook): MarkdownCell | null {
         }
     }
   }
-  return null; // Only find, do not create here. Creation is handled in updateSummaryUI.
+  return null;
 }
 
 function updateSummaryUI(panel: NotebookPanel) {
@@ -131,7 +140,6 @@ function updateSummaryUI(panel: NotebookPanel) {
   
     let summaryCellWidget = findOrCreateSummaryCell(nb);
     
-    // If cell doesn't exist, create it using the robust method
     if (!summaryCellWidget) {
         console.log('[UI] Summary cell not found, creating one.');
         const newCellModel = new MarkdownCellModel({ metadata: { tags: [SUMMARY_CELL_TAG] } });
@@ -147,13 +155,11 @@ function updateSummaryUI(panel: NotebookPanel) {
             });
         } else {
             console.warn('[UI] Could not find a method to insert the new cell.');
-            return; // Exit if we can't create the cell
+            return;
         }
-        // After creation, find it again to ensure we have the widget handle
         summaryCellWidget = findOrCreateSummaryCell(nb);
     }
     
-    // Update the content of the (now existing) cell
     if (summaryCellWidget) {
         const model = summaryCellWidget.model as MarkdownCellModel;
         if (model.sharedModel.getSource() !== md) {
@@ -162,10 +168,6 @@ function updateSummaryUI(panel: NotebookPanel) {
         nb.model.dirty = true;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Core Logic & Event Handlers                                        */
-/* ------------------------------------------------------------------ */
 
 function loadSummaryFromUI(panel: NotebookPanel) {
     let summary: Summary = { runCnt: 0, errCnt: 0, activeMs: 0, markdownActiveMs: 0, uniqueCellsExecuted: 0 };
@@ -199,8 +201,6 @@ function loadSummaryFromUI(panel: NotebookPanel) {
         executedCells: new Set() 
     });
 
-    // Create/update the UI cell. If it doesn't exist, this will create it.
-    // If it exists, this will refresh it (in case the progress % needs updating).
     updateSummaryUI(panel);
 }
 
