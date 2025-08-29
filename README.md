@@ -1,6 +1,6 @@
 # jupyter_engagement_helper
 
-[![Github Actions Status](https://github.com/ShinChanOvO/Jupyter-Engagement-Helper.git/workflows/Build/badge.svg)](https://github.com/ShinChanOvO/Jupyter-Engagement-Helper.git/actions/workflows/build.yml)
+[(https://github.com/ShinChanOvO/Jupyter-Engagement-Helper.git/workflows/Build/badge.svg)](https://github.com/ShinChanOvO/Jupyter-Engagement-Helper.git/actions/workflows/build.yml)
 Embed engagement data into notebooks
 
 ## Requirements
